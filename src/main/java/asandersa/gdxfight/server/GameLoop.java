@@ -1,49 +1,89 @@
 package asandersa.gdxfight.server;
 
+import asandersa.gdxfight.server.actors.Ship;
 import asandersa.gdxfight.server.ws.WebSocketHandler;
 import com.badlogic.gdx.ApplicationAdapter;
-import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.utils.Json;
+import com.badlogic.gdx.utils.ObjectMap;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.TextMessage;
-import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.adapter.standard.StandardWebSocketSession;
 
 import java.io.IOException;
+import java.util.concurrent.ForkJoinPool;
 
 @Component
 
 public class GameLoop extends ApplicationAdapter {
+    private static final float frameRate = 1 / 2f;
     private final WebSocketHandler socketHandler;
-    private final Array<String> events = new Array<>();
+    private final Json json;
+    private float lastRender = 0;
+    private final ObjectMap<String, Ship> ships = new ObjectMap<>();
+    private final ForkJoinPool pool = ForkJoinPool.commonPool();
 
-    public GameLoop(WebSocketHandler socketHandler) {
+
+    public GameLoop(WebSocketHandler socketHandler, Json json) {
         this.socketHandler = socketHandler;
+        this.json = json;
     }
 
     @Override
     public void create() {
         socketHandler.setConnectListener(session -> {
-            events.add(session.getId() + " just joined");
-
+            Ship ship = new Ship();
+            ship.setId(session.getId());
+            ships.put(session.getId(), ship);
+            try {
+                session.getNativeSession().getBasicRemote().sendText(session.getId());
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         });
         socketHandler.setDisconnectListener(session -> {
-            events.add(session.getId() + " just disconnected");
+            ships.remove(session.getId());
         });
         socketHandler.setMessageListener(((session, message) -> {
-            events.add(session.getId() + " said" + message);
+            pool.execute(() -> {
+                String type = message.getString("type");
+                switch (type) {
+                    case "state":
+                        Ship ship = ships.get(session.getId());
+                        ship.setLeftPressed(message.getBoolean("leftPressed"));
+                        ship.setRightPressed(message.getBoolean("rightPressed"));
+                        ship.setUpPressed(message.getBoolean("upPressed"));
+                        ship.setDownPressed(message.getBoolean("downPressed"));
+                        ship.setAngle(message.getFloat("angle"));
+                    break;
+                    default:
+                        throw new RuntimeException("Unknown WS object type: " + type);
+                }
+            });
         }));
     }
 
     @Override
     public void render() {
-        for (WebSocketSession session : socketHandler.getSessions()) { //получаем все актуальные сессии
-            try {
-                for (String event : events) {
-                    session.sendMessage(new TextMessage(event));
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
+        lastRender += Gdx.graphics.getDeltaTime();
+        if (lastRender >= frameRate) {
+            for (ObjectMap.Entry<String, Ship> shipEntry : ships) {
+                Ship ship = shipEntry.value;
+                ship.act(lastRender);
             }
-            events.clear();
+            ;
+
+            lastRender = 0;
+
+            pool.execute(() -> {
+                String stateJson = json.toJson(ships);
+                for (StandardWebSocketSession session : socketHandler.getSessions()) {
+                    try {
+                        session.getNativeSession().getBasicRemote().sendText(stateJson);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
         }
     }
 }
